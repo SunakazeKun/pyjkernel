@@ -397,7 +397,28 @@ class JKRArchive:
     def _fix_nodes_and_directories_(self):
         self._dirs_.clear()
         self._fix_node_and_directories_(self._root_)
-        self._recalculate_file_indices_()
+
+        if self.sync_file_ids:
+            self._next_file_id_ = len(self._dirs_)
+
+            for i, dir_entry in enumerate(self._dirs_):
+                if dir_entry._file_ is not None:
+                    dir_entry._index_ = i
+                else:
+                    node_index = self._nodes_.index(dir_entry._node_) if dir_entry._node_ is not None else 0xFFFFFFFF
+                    dir_entry._off_file_data_ = node_index
+        else:
+            file_id = 0
+
+            for dir_entry in self._dirs_:
+                if dir_entry._file_ is not None:
+                    dir_entry._index_ = file_id
+                    file_id += 1
+                else:
+                    node_index = self._nodes_.index(dir_entry._node_) if dir_entry._node_ is not None else 0xFFFFFFFF
+                    dir_entry._off_file_data_ = node_index
+
+            self._next_file_id_ = file_id
 
     def _fix_node_and_directories_(self, folder_node: JKRFolderNode):
         # Put the shortcut directories ("." and "..") at the end of the node's directory list
@@ -405,8 +426,6 @@ class JKRArchive:
         folders = filter(lambda de: de._file_ is None and de._name_ not in [".", ".."], folder_node._dirs_)
 
         for subdir in shortcuts:
-            node_index = self._nodes_.index(subdir._node_) if subdir._node_ is not None else 0xFFFFFFFF
-            subdir._off_file_data_ = node_index
             subdir._index_ = 0xFFFF
             folder_node._dirs_.remove(subdir)
             folder_node._dirs_.append(subdir)
@@ -417,10 +436,7 @@ class JKRArchive:
 
         # Handle subfolders as well
         for subdir in folders:
-            node_index = self._nodes_.index(subdir._node_)
-            subdir._off_file_data_ = node_index
             subdir._index_ = 0xFFFF
-
             self._fix_node_and_directories_(subdir._node_)
 
     def _create_dir_entry_(self, name: str, attr: int, node: JKRFolderNode, parent_node: JKRFolderNode) -> JKRDirEntry:
@@ -494,35 +510,9 @@ class JKRArchive:
 
         return None
 
-    def _recalculate_file_indices_(self):
-        if self.sync_file_ids:
-            self._next_file_id_ = len(self._dirs_)
-
-            for i, dir_entry in enumerate(self._dirs_):
-                if dir_entry._file_ is not None:
-                    dir_entry._index_ = i
-        else:
-            file_id = 0
-
-            for dir_entry in self._dirs_:
-                if dir_entry._file_ is not None:
-                    dir_entry._index_ = file_id
-                    file_id += 1
-
-            self._next_file_id_ = file_id
-
     # ------------------------------------------------------------------------------------------------------------------
     # High level operations
     # ------------------------------------------------------------------------------------------------------------------
-    @property
-    def sync_file_ids(self):
-        return self.sync_file_ids
-
-    @sync_file_ids.setter
-    def sync_file_ids(self, val: bool):
-        self.sync_file_ids = val
-        self._recalculate_file_indices_()
-
     def get_file(self, file_path: str) -> JKRArchiveFile:
         split_path = file_path.rsplit("/", 1)
 
