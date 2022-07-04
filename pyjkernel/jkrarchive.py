@@ -5,12 +5,12 @@ from . import jkrcomp
 
 __all__ = [
     "JKRArchiveException", "JKRArchive", "JKRArchiveFile", "JKRPreloadType", "create_new_archive",
-    "from_buffer", "from_archive_file", "write_archive_file", "write_archive_buffer"
+    "from_archive_buffer", "from_archive_file", "write_archive_file", "write_archive_buffer"
 ]
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# Exception for JKRArchive-related actions
+# Exception for JKRArchive-related actions.
 # ----------------------------------------------------------------------------------------------------------------------
 class JKRArchiveException(Exception):
     """
@@ -20,17 +20,18 @@ class JKRArchiveException(Exception):
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# Helper methods to deal with reading and writing
+# Declarations of folder node and directory entry structures. These low-level classes will not be visibly exported by
+# the module. Instead, JKRArchive handles these structures automatically. The module offers a high-level file accessor
+# for file directories instead. Some helper functions to read and write data can be found here as well.
 # ----------------------------------------------------------------------------------------------------------------------
 def _file_name_to_hash_(file_name: str) -> int:
     file_hash = 0
     for ch in file_name.encode("ascii"):
-        file_hash *= 3
-        file_hash += ch
+        file_hash = (file_hash * 3) + ch
     return file_hash & 0xFFFF
 
 
-def _calc_dir_identifier_(dir_name: str, is_root: bool) -> int:
+def _calc_node_identifier_(dir_name: str, is_root: bool) -> int:
     # Root node uses "ROOT" as identifier
     if is_root:
         return 0x524F4F54
@@ -47,6 +48,117 @@ def _calc_dir_identifier_(dir_name: str, is_root: bool) -> int:
             identifier += enc_upper[i]
 
     return identifier
+
+
+class SNodeEntry:
+    __STRUCT_BE__ = struct.Struct(">2I2HI")
+    __STRUCT_LE__ = struct.Struct("<2I2HI")
+
+    def __init__(self):
+        self._identifier_ = 0       # Updated by "SNodeEntry._pack_". Currently not used by the module.
+        self._off_name_ = 0         # Updated by "JKRArchive._pack_".
+        self._hash_ = 0             # Updated by "SNodeEntry._pack_". Currently not used by the module.
+        self._num_files_ = 0        # Updated by "SNodeEntry._pack_".
+        self._idx_files_start_ = 0  # Updated by "JKRArchive._fix_nodes_and_directories_".
+
+        self._archive_ = None       # The archive to which this node belongs.
+        self._name_ = ""            # The node's folder name.
+        self._dirs_ = list()        # The directories held by this node.
+
+    def _unpack_(self, data, off: int, is_big_endian: bool):
+        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
+
+        self._identifier_, self._off_name_, self._hash_, self._num_files_, self._idx_files_start_ = strct.unpack_from(data, off)
+
+    def _pack_(self, data, off: int, is_big_endian: bool):
+        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
+
+        self._identifier_ = _calc_node_identifier_(self._name_, self._archive_._root_ == self)
+        self._hash_ = _file_name_to_hash_(self._name_)
+        self._num_files_ = len(self._dirs_)
+
+        strct.pack_into(data, off, self._identifier_, self._off_name_, self._hash_, self._num_files_, self._idx_files_start_)
+
+
+class SDirEntry:
+    __STRUCT_BE__ = struct.Struct(">2H4I")
+    __STRUCT_LE__ = struct.Struct("<2H4I")
+
+    def __init__(self):
+        self._index_ = 0xFFFF     # Updated whenever a file gets created, deleted, etc.
+        self._hash_ = 0           # Updated by "SDirEntry._pack_". Currently not used by the module.
+        self._attributes_ = 0     # Updated by "SDirEntry._pack_".
+        self._off_name_ = 0       # Updated by "JKRArchive._pack_".
+        self._off_file_data_ = 0  # Updated by "JKRArchive._pack_" (files) / "._fix_node_and_directories_" (folders).
+        self._len_file_data_ = 0  # Updated by "SDirEntry._pack_".
+        self._unk10_ = 0          # Currently not used by the module.
+
+        self._archive_ = None     # The archive to which this directory belongs.
+        self._name_ = ""          # The directory's name.
+        self._parent_ = None      # The parent node to which this directory belongs.
+        self._node_ = None        # The node that this directory represents (only for folders).
+        self._file_ = None        # The file accessor that this directory represents (only for files).
+
+    def _unpack_(self, data, off: int, is_big_endian: bool):
+        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
+
+        self._index_, self._hash_, self._attributes_, self._off_file_data_, self._len_file_data_, self._unk10_ = strct.unpack_from(data, off)
+
+        self._off_name_ = self._attributes_ & 0x00FFFFFF
+        self._attributes_ = self._attributes_ >> 24
+
+    def _pack_(self, data, off: int, is_big_endian: bool):
+        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
+
+        # File
+        if self._file_ is not None:
+            self._attributes_ = DirAttr.FILE
+            self._len_file_data_ = len(self._file_.data)
+
+            if self._file_.compression == jkrcomp.JKRCompression.SZS:
+                self._attributes_ |= DirAttr.COMPRESSED | DirAttr.USE_SZS
+            elif self._file_.compression == jkrcomp.JKRCompression.SZP:
+                self._attributes_ |= DirAttr.COMPRESSED
+
+            if self._file_.preload == JKRPreloadType.MRAM:
+                self._attributes_ |= DirAttr.PRELOAD_MRAM
+            elif self._file_.preload == JKRPreloadType.ARAM:
+                self._attributes_ |= DirAttr.PRELOAD_ARAM
+            elif self._file_.preload == JKRPreloadType.DVD:
+                self._attributes_ |= DirAttr.PRELOAD_DVD
+        # Folder
+        else:
+            self._attributes_ = DirAttr.FOLDER
+            self._index_ = 0xFFFF
+            self._len_file_data_ = 0x10
+
+        self._hash_ = _file_name_to_hash_(self._name_)
+        attr = (self._attributes_ << 24) | self._off_name_
+
+        strct.pack_into(data, off, self._index_, self._hash_, attr, self._off_file_data_, self._len_file_data_, self._unk10_)
+
+    @property
+    def is_file(self):
+        return self._file_ is not None
+
+    @property
+    def is_folder(self):
+        return self._file_ is None and self._name_ not in [".", ".."]
+
+    @property
+    def is_shortcut(self):
+        return self._file_ is None and self._name_ in [".", ".."]
+
+
+class DirAttr(enum.IntFlag):
+    FILE         = 1
+    FOLDER       = 2
+    COMPRESSED   = 4
+    _8           = 8
+    PRELOAD_MRAM = 16
+    PRELOAD_ARAM = 32
+    PRELOAD_DVD  = 64
+    USE_SZS      = 128
 
 
 def _read_string_(data, offset: int) -> str:
@@ -69,102 +181,10 @@ def _get_alignment_(data) -> bytes:
 
 
 # ----------------------------------------------------------------------------------------------------------------------
-# Folder node and directory structures
+# Declarations of high-level file accessor and enumerations. The file accessor "wraps" a file directory from an archive.
+# These will be visibly exported by the module.
 # ----------------------------------------------------------------------------------------------------------------------
-class JKRFolderNode:
-    __STRUCT_BE__ = struct.Struct(">2I2HI")
-    __STRUCT_LE__ = struct.Struct("<2I2HI")
-
-    def __init__(self):
-        self._identifier_ = 0
-        self._off_name_ = 0         # Updated when packing the archive
-        self._hash_ = 0             # Automatically updated when packing the entry
-        self._num_files_ = 0        # Automatically updated when packing the entry
-        self._idx_files_start_ = 0  # Updated whenever a file gets created, deleted, etc.
-
-        self._archive_ = None       # The archive to which this node belongs
-        self._name_ = ""            # The node's name
-        self._dirs_ = list()        # The directories held by this node
-
-    def _unpack_(self, data, off: int, is_big_endian: bool):
-        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
-        self._identifier_, self._off_name_, self._hash_, self._num_files_, self._idx_files_start_ = strct.unpack_from(data, off)
-
-    def _pack_(self, data, off: int, is_big_endian: bool):
-        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
-
-        self._identifier_ = _calc_dir_identifier_(self._name_, self._archive_._root_ == self)
-        self._hash_ = _file_name_to_hash_(self._name_)
-        self._num_files_ = len(self._dirs_)
-        strct.pack_into(data, off, self._identifier_, self._off_name_, self._hash_, self._num_files_, self._idx_files_start_)
-
-
-class JKRDirEntry:
-    __STRUCT_BE__ = struct.Struct(">2H4I")
-    __STRUCT_LE__ = struct.Struct("<2H4I")
-
-    def __init__(self):
-        self._index_ = 0xFFFF     # Updated whenever a file gets created, deleted, etc.
-        self._hash_ = 0           # Automatically updated when packing the entry
-        self._attributes_ = 0     # Automatically updated when packing the entry
-        self._off_name_ = 0       # Updated when packing the archive
-        self._off_file_data_ = 0  # For file directories, this is updated when packing the archive
-        self._len_file_data_ = 0  # Automatically updated when packing the entry
-        self._unk10_ = 0          # Not used as of now
-
-        self._archive_ = None     # The archive to which this directory belongs
-        self._name_ = ""          # The directory's name
-        self._parent_ = None      # The parent node to which this directory belongs
-        self._node_ = None        # The node that this directory represents (only for folders)
-        self._file_ = None        # The file info that this directory represents (only for files)
-
-    def _unpack_(self, data, off: int, is_big_endian: bool):
-        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
-        self._index_, self._hash_, self._attributes_, self._off_file_data_, self._len_file_data_, self._unk10_ = strct.unpack_from(data, off)
-        self._off_name_ = self._attributes_ & 0x00FFFFFF
-        self._attributes_ = self._attributes_ >> 24
-
-    def _pack_(self, data, off: int, is_big_endian: bool):
-        strct = self.__STRUCT_BE__ if is_big_endian else self.__STRUCT_LE__
-
-        if self._file_ is not None:
-            self._attributes_ = JKRDirAttr.FILE
-            self._len_file_data_ = len(self._file_.data)
-
-            if self._file_.compression == jkrcomp.JKRCompression.SZS:
-                self._attributes_ |= JKRDirAttr.COMPRESSED | JKRDirAttr.USE_SZS
-            elif self._file_.compression == jkrcomp.JKRCompression.SZP:
-                self._attributes_ |= JKRDirAttr.COMPRESSED
-
-            if self._file_.preload == JKRPreloadType.MRAM:
-                self._attributes_ |= JKRDirAttr.PRELOAD_MRAM
-            elif self._file_.preload == JKRPreloadType.ARAM:
-                self._attributes_ |= JKRDirAttr.PRELOAD_ARAM
-            elif self._file_.preload == JKRPreloadType.DVD:
-                self._attributes_ |= JKRDirAttr.PRELOAD_DVD
-        else:
-            self._attributes_ = JKRDirAttr.FOLDER
-
-        self._hash_ = _file_name_to_hash_(self._name_)
-        attr = (self._attributes_ << 24) | self._off_name_
-        strct.pack_into(data, off, self._index_, self._hash_, attr, self._off_file_data_, self._len_file_data_, self._unk10_)
-
-
-class JKRDirAttr(enum.IntFlag):
-    FILE         = 1
-    FOLDER       = 2
-    COMPRESSED   = 4
-    _8           = 8
-    PRELOAD_MRAM = 16
-    PRELOAD_ARAM = 32
-    PRELOAD_DVD  = 64
-    USE_SZS      = 128
-
-
-# ----------------------------------------------------------------------------------------------------------------------
-# Simplified file accessor
-# ----------------------------------------------------------------------------------------------------------------------
-class JKRPreloadType(enum.IntEnum):
+class JKRPreloadType(enum.Enum):
     MRAM = 0
     ARAM = 1
     DVD = 2
@@ -204,34 +224,44 @@ class JKRArchive:
     __STRUCT_HEADER_LE__ = struct.Struct("<8I")
     __STRUCT_INFO_BE__ = struct.Struct(">6IH?")
     __STRUCT_INFO_LE__ = struct.Struct("<6IH?")
-    __MAGIC__ = 0x52415243
+    __MAGIC__ = 0x52415243  # "RARC" hexspeak
 
     def __init__(self):
-        self.sync_file_ids = True
+        self._root_ = None           # The archive's root node.
+        self._nodes_ = list()        # All of the folder nodes.
+        self._dirs_ = list()         # Collection of all directory entries.
+        self._next_file_id_ = 0      # The next file ID to be used.
+        self._sync_file_ids_ = True  # Synchronizes file IDs with dir entry index.
 
-        self._root_ = None
-        self._nodes_ = list()
-        self._dirs_ = list()
+        # Lookup maps for fast file and node access
+        self._lookup_files_ = dict()
+        self._lookup_nodes_ = dict()
 
-        self._next_file_id_ = 0
+        # Temporary data storage; used during saving process
         self._mram_files_ = list()
         self._aram_files_ = list()
         self._dvd_files_ = list()
 
+    # ------------------------------------------------------------------------------------------------------------------
+    # Packing and unpacking
+    # ------------------------------------------------------------------------------------------------------------------
     def _unpack_(self, data, is_big_endian: bool):
+        # Attempt to decompress buffer first
         data = jkrcomp.decompress(data)
 
         if struct.unpack_from(">I" if is_big_endian else "<I", data, 0)[0] != self.__MAGIC__:
-            raise JKRArchiveException("No RARC data provided.")
+            raise JKRArchiveException("Provided data does not start with RARC header.")
 
-        # Prepare correct structures
+        # Parse RARC header and info block
         strct_header = self.__STRUCT_HEADER_BE__ if is_big_endian else self.__STRUCT_HEADER_LE__
         strct_info = self.__STRUCT_INFO_BE__ if is_big_endian else self.__STRUCT_INFO_LE__
 
-        # Parse RARC header and info block
-        _, _, off_info, len_info, _, _, _, _\
+        _, _, off_info, len_info,\
+        _, _, _, _\
             = strct_header.unpack_from(data, 0)
-        num_nodes, off_nodes, num_dirs, off_files, _, off_strings, self._next_file_id_, self.sync_file_ids\
+
+        num_nodes, off_nodes, num_dirs, off_files,\
+        _, off_strings, self._next_file_id_, self._sync_file_ids_\
             = strct_info.unpack_from(data, off_info)
 
         # Calculate absolute offsets
@@ -244,7 +274,7 @@ class JKRArchive:
         off_tmp = off_nodes
 
         for _ in range(num_nodes):
-            folder_node = JKRFolderNode()
+            folder_node = SNodeEntry()
             folder_node._unpack_(data, off_tmp, is_big_endian)
             folder_node._name_ = _read_string_(data, off_strings + folder_node._off_name_)
             folder_node._archive_ = self
@@ -259,7 +289,7 @@ class JKRArchive:
         off_tmp = off_files
 
         for _ in range(num_dirs):
-            dir_entry = JKRDirEntry()
+            dir_entry = SDirEntry()
             dir_entry._unpack_(data, off_tmp, is_big_endian)
             dir_entry._name_ = _read_string_(data, off_strings + dir_entry._off_name_)
             dir_entry._archive_ = self
@@ -269,11 +299,11 @@ class JKRArchive:
             attrs = dir_entry._attributes_
 
             # Folder entry
-            if attrs & JKRDirAttr.FOLDER and dir_entry._off_file_data_ != 0xFFFFFFFF:
+            if attrs & DirAttr.FOLDER and dir_entry._off_file_data_ != 0xFFFFFFFF:
                 dir_entry._node_ = self._nodes_[dir_entry._off_file_data_]
 
             # File entry
-            elif attrs & JKRDirAttr.FILE:
+            elif attrs & DirAttr.FILE:
                 file_access = JKRArchiveFile()
                 dir_entry._file_ = file_access
                 file_access._dir_ = dir_entry
@@ -281,14 +311,14 @@ class JKRArchive:
                 # Read file data
                 file_start = off_data + dir_entry._off_file_data_
                 file_end = file_start + dir_entry._len_file_data_
-                file_access.data = jkrcomp.decompress(data[file_start:file_end])
+                file_access.data = data[file_start:file_end]
 
                 # Get preload type
-                if attrs & JKRDirAttr.PRELOAD_MRAM:
+                if attrs & DirAttr.PRELOAD_MRAM:
                     file_access.preload = JKRPreloadType.MRAM
-                elif attrs & JKRDirAttr.PRELOAD_ARAM:
+                elif attrs & DirAttr.PRELOAD_ARAM:
                     file_access.preload = JKRPreloadType.ARAM
-                elif attrs & JKRDirAttr.PRELOAD_DVD:
+                elif attrs & DirAttr.PRELOAD_DVD:
                     file_access.preload = JKRPreloadType.DVD
                 else:
                     raise JKRArchiveException(f"File {dir_entry._name_} has no preload type!")
@@ -299,6 +329,8 @@ class JKRArchive:
                 dir_entry = self._dirs_[i]
                 dir_entry._parent_ = folder_node
                 folder_node._dirs_.append(dir_entry)
+
+        self._initialize_lookup_()
 
     def _pack_(self, is_big_endian: bool) -> bytearray:
         # Sort files into respective preload memory groups
@@ -326,7 +358,7 @@ class JKRArchive:
         string_pool += f".\0..\0{self._root_._name_}\0".encode("ascii")
         self._root_._off_name_ = 5
 
-        def collect_strings(folder_node: JKRFolderNode):
+        def collect_strings(folder_node: SNodeEntry):
             nonlocal string_pool
 
             for dir_entry in folder_node._dirs_:
@@ -386,28 +418,54 @@ class JKRArchive:
         strct_info = self.__STRUCT_INFO_BE__ if is_big_endian else self.__STRUCT_INFO_LE__
         total_file_size = len(buffer)
 
-        strct_header.pack_into(buffer, 0, self.__MAGIC__, total_file_size, 0x20, data_start - 0x20, total_file_size - data_start, mram_size, aram_size, dvd_size)
-        strct_info.pack_into(buffer, 0x20, num_nodes, off_nodes, num_dirs, off_dirs, len_strings, off_strings, self._next_file_id_, self.sync_file_ids)
+        strct_header.pack_into(buffer, 0,
+                               self.__MAGIC__, total_file_size, 0x20, data_start - 0x20,
+                               total_file_size - data_start, mram_size, aram_size, dvd_size)
+        strct_info.pack_into(buffer, 0x20,
+                             num_nodes, off_nodes, num_dirs, off_dirs,
+                             len_strings, off_strings, self._next_file_id_, self._sync_file_ids_)
 
         return buffer
 
     # ------------------------------------------------------------------------------------------------------------------
     # Helper functions for structure
     # ------------------------------------------------------------------------------------------------------------------
+    def _initialize_lookup_(self):
+        path = self._root_._name_.lower()
+        self._lookup_nodes_[path] = self._root_
+        self._initialize_lookup_node_(self._root_, path)
+
+    def _initialize_lookup_node_(self, folder_node: SNodeEntry, current_path: str):
+        for dir_entry in folder_node._dirs_:
+            if dir_entry.is_file:
+                path = current_path + "/" + dir_entry._name_.lower()
+                self._lookup_files_[path] = dir_entry._file_
+            elif dir_entry.is_folder:
+                next_node = dir_entry._node_
+                path = current_path + "/" + next_node._name_.lower()
+                self._lookup_nodes_[path] = next_node
+                self._initialize_lookup_node_(next_node, path)
+
     def _fix_nodes_and_directories_(self):
         self._dirs_.clear()
         self._fix_node_and_directories_(self._root_)
         self._recalculate_file_indices_()
 
-    def _fix_node_and_directories_(self, folder_node: JKRFolderNode):
+    def _fix_node_and_directories_(self, folder_node: SNodeEntry):
         # Put the shortcut directories ("." and "..") at the end of the node's directory list
-        shortcuts = filter(lambda de: de._file_ is None and de._name_ in [".", ".."], folder_node._dirs_)
-        folders = filter(lambda de: de._file_ is None and de._name_ not in [".", ".."], folder_node._dirs_)
+        folders = list()
+        shortcuts = list()
+
+        for dir_entry in list(folder_node._dirs_):
+            if dir_entry.is_shortcut:
+                shortcuts.append(dir_entry)
+            elif dir_entry.is_folder:
+                folders.append(dir_entry)
 
         for subdir in shortcuts:
             node_index = self._nodes_.index(subdir._node_) if subdir._node_ is not None else 0xFFFFFFFF
             subdir._off_file_data_ = node_index
-            subdir._index_ = 0xFFFF
+
             folder_node._dirs_.remove(subdir)
             folder_node._dirs_.append(subdir)
 
@@ -419,12 +477,28 @@ class JKRArchive:
         for subdir in folders:
             node_index = self._nodes_.index(subdir._node_)
             subdir._off_file_data_ = node_index
-            subdir._index_ = 0xFFFF
 
             self._fix_node_and_directories_(subdir._node_)
 
-    def _create_dir_entry_(self, name: str, attr: int, node: JKRFolderNode, parent_node: JKRFolderNode) -> JKRDirEntry:
-        dir_entry = JKRDirEntry()
+    def _recalculate_file_indices_(self):
+        if self._sync_file_ids_:
+            self._next_file_id_ = len(self._dirs_)
+
+            for i, dir_entry in enumerate(self._dirs_):
+                if dir_entry.is_file:
+                    dir_entry._index_ = i
+        else:
+            file_id = 0
+
+            for dir_entry in self._dirs_:
+                if dir_entry.is_file:
+                    dir_entry._index_ = file_id
+                    file_id += 1
+
+            self._next_file_id_ = file_id
+
+    def _create_dir_entry_(self, name: str, attr: int, node: SNodeEntry, parent_node: SNodeEntry) -> SDirEntry:
+        dir_entry = SDirEntry()
         dir_entry._name_ = name
         dir_entry._attributes_ = attr
         dir_entry._node_ = node
@@ -439,177 +513,185 @@ class JKRArchive:
         if self._root_:
             raise JKRArchiveException("Fatal! Root already exists!")
 
-        root_node = JKRFolderNode()
+        root_node = SNodeEntry()
         root_node._name_ = root_name
         root_node._archive_ = self
         self._root_ = root_node
         self._nodes_.append(root_node)
 
-        self._create_dir_entry_(".", JKRDirAttr.FOLDER, root_node, root_node)
-        self._create_dir_entry_("..", JKRDirAttr.FOLDER, None, root_node)
+        self._create_dir_entry_(".", DirAttr.FOLDER, root_node, root_node)
+        self._create_dir_entry_("..", DirAttr.FOLDER, None, root_node)
 
         self._fix_nodes_and_directories_()
 
-    def _find_folder_(self, folder_path: str) -> JKRFolderNode:
-        split_path = folder_path.split("/")
-
-        # Only root folder name provided
-        root_name = split_path[0]
-
-        if len(split_path) == 1:
-            if self._root_._name_.casefold() == root_name.casefold():
-                return self._root_
-            return None
-
-        folders = split_path[1:-1]
-        folder_name = split_path[-1]
-
-        if self._root_._name_.casefold() != root_name.casefold():
-            return None
-
-        # Walk through folder nodes
-        folder_node = self._root_
-
-        for sub_folder_name in folders:
-            next_folder = None
-
-            # Find subfolder
-            for dir_entry in folder_node._dirs_:
-                if dir_entry._name_.casefold() == sub_folder_name.casefold():
-                    if dir_entry._file_ is None:
-                        next_folder = dir_entry._node_
-                    break
-
-            if next_folder is None:
-                return None
-
-            folder_node = next_folder
-
-        # Locate file in folder node
-        for dir_entry in folder_node._dirs_:
-            if dir_entry._name_.casefold() == folder_name.casefold():
-                if dir_entry._file_ is None:
-                    return dir_entry._node_
-                return None
-
-        return None
-
-    def _recalculate_file_indices_(self):
-        if self.sync_file_ids:
-            self._next_file_id_ = len(self._dirs_)
-
-            for i, dir_entry in enumerate(self._dirs_):
-                if dir_entry._file_ is not None:
-                    dir_entry._index_ = i
-        else:
-            file_id = 0
-
-            for dir_entry in self._dirs_:
-                if dir_entry._file_ is not None:
-                    dir_entry._index_ = file_id
-                    file_id += 1
-
-            self._next_file_id_ = file_id
-
     # ------------------------------------------------------------------------------------------------------------------
-    # High level operations
+    # High-level operations
     # ------------------------------------------------------------------------------------------------------------------
     @property
-    def sync_file_ids(self):
-        return self.sync_file_ids
+    def sync_file_ids(self) -> bool:
+        return self._sync_file_ids_
 
     @sync_file_ids.setter
     def sync_file_ids(self, val: bool):
-        self.sync_file_ids = val
+        self._sync_file_ids_ = val
         self._recalculate_file_indices_()
 
+    @property
+    def root_name(self) -> str:
+        return self._root_._name_
+
+    def directory_exists(self, file_path: str) -> bool:
+        key = file_path.lower()
+        return key in self._lookup_files_ or key in self._lookup_nodes_
+
+    def list_files(self, folder_path: str) -> list:
+        key = folder_path.lower()
+        if key not in self._lookup_nodes_:
+            raise JKRArchiveException(f"The folder {folder_path} does not exist!")
+        return list(de._file_ for de in filter(lambda de: de.is_file, self._lookup_nodes_[key]._dirs_))
+
+    def list_folders(self, folder_path: str) -> list:
+        key = folder_path.lower()
+        if key not in self._lookup_nodes_:
+            raise JKRArchiveException(f"The folder {folder_path} does not exist!")
+        return list(de._name_ for de in filter(lambda de: de.is_folder, self._lookup_nodes_[key]._dirs_))
+
     def get_file(self, file_path: str) -> JKRArchiveFile:
-        split_path = file_path.rsplit("/", 1)
-
-        # Only root folder name provided. Root cannot be a file
-        if len(split_path) == 1:
-            return None
-
-        folder_path, file_name = split_path
-        folder_node = self._find_folder_(folder_path)
-
-        if folder_node is None:
-            return None
-
-        # Locate file in folder node
-        for dir_entry in folder_node._dirs_:
-            if dir_entry._name_.casefold() == file_name.casefold():
-                if dir_entry._file_ is not None:
-                    return dir_entry._file_
-                return None
-
-        return None
-
-    def exists_file(self, file_path: str) -> bool:
-        return self.get_file(file_path) is not None
+        key = file_path.lower()
+        if key not in self._lookup_files_:
+            raise JKRArchiveException(f"The file {file_path} does not exist!")
+        return self._lookup_files_[key]
 
     def create_folder(self, folder_path: str):
+        # Check if directory already exists
+        full_key = folder_path.lower()
+
+        if full_key in self._lookup_nodes_ or full_key in self._lookup_files_:
+            raise JKRArchiveException(f"The directory {folder_path} already exists!")
+
+        # Get parent folder first
         split_path = folder_path.rsplit("/", 1)
 
-        # Only root folder name provided
         if len(split_path) == 1:
             return None
 
         folder_path, folder_name = split_path
-        folder_node = self._find_folder_(folder_path)
+        folder_path_key = folder_path.lower()
 
-        if folder_node is None:
+        if folder_path_key not in self._lookup_nodes_:
             raise JKRArchiveException("Cannot create folder. Archive does not contain the folder " + folder_path)
 
-        # Check if directory already exists
-        for dir_entry in folder_node._dirs_:
-            if dir_entry._name_.casefold() == folder_name.casefold():
-                raise JKRArchiveException(f"The directory {folder_path} already exists.")
+        folder_node = self._lookup_nodes_[folder_path_key]
 
         # Create new node and directories
-        new_folder_node = JKRFolderNode()
+        new_folder_node = SNodeEntry()
         new_folder_node._name_ = folder_name
         new_folder_node._archive_ = self
         self._nodes_.append(new_folder_node)
 
-        self._create_dir_entry_(folder_name, JKRDirAttr.FOLDER, new_folder_node, folder_node)
-        self._create_dir_entry_(".", JKRDirAttr.FOLDER, new_folder_node, new_folder_node)
-        self._create_dir_entry_("..", JKRDirAttr.FOLDER, folder_node, new_folder_node)
+        self._create_dir_entry_(folder_name, DirAttr.FOLDER, new_folder_node, folder_node)
+        self._create_dir_entry_(".", DirAttr.FOLDER, new_folder_node, new_folder_node)
+        self._create_dir_entry_("..", DirAttr.FOLDER, folder_node, new_folder_node)
+
+        self._lookup_nodes_[full_key] = new_folder_node
 
         self._fix_nodes_and_directories_()
 
-    def create_file(self, file_path: str) -> JKRArchiveFile:
+    def create_file(self, file_path: str, data=bytearray(), preload: JKRPreloadType = JKRPreloadType.MRAM) -> JKRArchiveFile:
+        # Check if directory already exists
+        full_key = file_path.lower()
+
+        if full_key in self._lookup_nodes_ or full_key in self._lookup_files_:
+            raise JKRArchiveException(f"The directory {file_path} already exists!")
+
+        # Get parent folder first
         split_path = file_path.rsplit("/", 1)
 
-        # Only root folder name provided. Root cannot be a file
         if len(split_path) == 1:
             return None
 
         folder_path, file_name = split_path
-        folder_node = self._find_folder_(folder_path)
+        folder_path_key = folder_path.lower()
 
-        if folder_node is None:
+        if folder_path_key not in self._lookup_nodes_:
             raise JKRArchiveException("Cannot create file. Archive does not contain the folder " + folder_path)
 
-        # Check if directory already exists
-        for dir_entry in folder_node._dirs_:
-            if dir_entry._name_.casefold() == file_name.casefold():
-                raise JKRArchiveException(f"The directory {file_path} already exists.")
+        folder_node = self._lookup_nodes_[folder_path_key]
 
         # Create new directory and file entries
-        dir_entry = self._create_dir_entry_(file_name, JKRDirAttr.FILE, None, folder_node)
-        dir_entry._file_ = JKRArchiveFile()
-        dir_entry._file_.data = bytearray()
-        dir_entry._file_.preload = JKRPreloadType.MRAM
+        dir_entry = self._create_dir_entry_(file_name, DirAttr.FILE, None, folder_node)
+        new_file = JKRArchiveFile()
+        new_file.data = data
+        new_file.preload = preload
+        new_file._dir_ = dir_entry
+        dir_entry._file_ = new_file
+
+        self._lookup_files_[full_key] = new_file
 
         self._fix_nodes_and_directories_()
-        return dir_entry._file_
+        return new_file
+
+    def remove_file(self, file_path: str):
+        key = file_path.lower()
+
+        if key not in self._lookup_files_:
+            raise JKRArchiveException(f"The file {file_path} does not exist!")
+
+        file_access = self._lookup_files_[key]
+        dir_entry = file_access._dir_
+        parent_node = dir_entry._parent_
+
+        # Detach file and clear access
+        parent_node._dirs_.remove(dir_entry)
+        dir_entry._parent_ = None
+        dir_entry._archive_ = None
+        dir_entry._file_ = None
+        file_access.data = None
+        file_access._dir_ = None
+
+        self._lookup_files_.pop(key)
+        self._dirs_.remove(dir_entry)
+        self._recalculate_file_indices_()
+
+    def remove_folder(self, folder_path: str):
+        raise NotImplementedError
+
+    def __repr__(self):
+        return self._print_(self._root_, 0)
+
+    def _print_(self, folder_node: SNodeEntry, depth: int):
+        indent = " " * depth
+        result = indent + folder_node._name_ + "\n"
+
+        folders = list()
+        files = list()
+
+        for dir_entry in folder_node._dirs_:
+            if dir_entry.is_file:
+                files.append(dir_entry._file_)
+            elif dir_entry.is_folder:
+                folders.append(dir_entry._node_)
+
+        for folder_node in folders:
+            result += self._print_(folder_node, depth + 1)
+
+        for file_access in files:
+            result += f" {indent}{file_access.name}\n"
+
+        return result
 
 
 # ----------------------------------------------------------------------------------------------------------------------
 # Helper I/O and creation functions
 # ----------------------------------------------------------------------------------------------------------------------
-def from_buffer(buffer, big_endian: bool = True) -> JKRArchive:
+def create_new_archive(root_name: str, sync_file_ids: bool = True):
+    jkrarc = JKRArchive()
+    jkrarc._sync_file_ids_ = sync_file_ids
+    jkrarc._create_root_(root_name)
+    return jkrarc
+
+
+def from_archive_buffer(buffer, big_endian: bool = True) -> JKRArchive:
     jkrarc = JKRArchive()
     jkrarc._unpack_(buffer, big_endian)
     return jkrarc
@@ -622,20 +704,13 @@ def from_archive_file(file_path: str, big_endian: bool = True) -> JKRArchive:
     return jkrarc
 
 
-def write_archive_buffer(jkrarc: JKRArchive, big_endian: bool = True):
-    return jkrarc._pack_(big_endian)
+def write_archive_buffer(jkrarc: JKRArchive, big_endian: bool = True, compression: jkrcomp.JKRCompression = jkrcomp.JKRCompression.NONE, level: int = 7):
+    return jkrcomp.compress(jkrarc._pack_(big_endian), compression, level)
 
 
-def write_archive_file(jkrarc: JKRArchive, file_path: str, big_endian: bool = True):
-    buffer = jkrarc._pack_(big_endian)
+def write_archive_file(jkrarc: JKRArchive, file_path: str, big_endian: bool = True, compression: jkrcomp.JKRCompression = jkrcomp.JKRCompression.NONE, level: int = 7):
+    buffer = jkrcomp.compress(jkrarc._pack_(big_endian), compression, level)
 
     with open(file_path, "wb") as f:
         f.write(buffer)
         f.flush()
-
-
-def create_new_archive(root_name: str, sync_file_ids: bool = True):
-    jkrarc = JKRArchive()
-    jkrarc.sync_file_ids = sync_file_ids
-    jkrarc._create_root_(root_name)
-    return jkrarc

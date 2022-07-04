@@ -1,5 +1,0 @@
-__version__ = "0.1.1"
-__author__ = "Aurum"
-
-from .jkrcomp import *
-from .jkrarchive import *

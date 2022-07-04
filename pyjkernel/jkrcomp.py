@@ -3,7 +3,7 @@ import struct
 from oead import yaz0
 
 __all__ = [
-    "JKRCompression", "check_compression", "decompress",
+    "JKRCompression", "check_compression", "decompress", "compress",
     "decompress_szs", "compress_szs", "decompress_szp", "compress_szp"
 ]
 
@@ -15,17 +15,17 @@ class JKRCompression(enum.Enum):
     NONE = 0  # Use no compression at all
     SZP = 1   # Not used in SMG1/2 but decoding this format is still supported by the game
     SZS = 2   # The compression format used by SMG1/2's ARC files and some others
+    ASR = 3   # Used by Home Menu stuff. Kept here for documentation purposes
 
 
 def check_compression(data) -> JKRCompression:
-    if len(data) < 4:
-        return JKRCompression.NONE
-
     if data[0] == 0x59 and data[1] == 0x61 and data[3] == 0x30:
         if data[2] == 0x7A:
             return JKRCompression.SZS
         elif data[2] == 0x79:
             return JKRCompression.SZP
+    elif data[0] == 0x41 and data[1] == 0x53 and data[2] == 0x52:
+        return JKRCompression.ASR
 
     return JKRCompression.NONE
 
@@ -35,6 +35,9 @@ def decompress(data) -> bytes:
     Attempts to decompress the input data using JKernel decompression algorithms. If no JKernel compression format was
     detected, the input buffer will be returned again.
 
+    ASR decompression is not implemented here since it is kept only for documentation purposes. Therefore, any attempt
+    at decompressing an ASR-encoded buffer will yield a ``NotImplementedError``.
+
     :param data: the buffer to be decompressed.
     :return: a bytes object containing the decompressed data or the input buffer if no compressed data was found.
     """
@@ -43,7 +46,18 @@ def decompress(data) -> bytes:
             return yaz0.decompress(data)
         elif data[2] == 0x79:
             return decompress_szp_unchecked(data)
+    elif data[0] == 0x41 and data[1] == 0x53 and data[2] == 0x52:
+        raise NotImplementedError("ASR decompression is not supported yet.")
+    return data
 
+
+def compress(data, compression: JKRCompression, level: int = 7) -> bytes:
+    if compression == JKRCompression.SZS:
+        return compress_szs(data, level)
+    elif compression == JKRCompression.SZP:
+        return compress_szp(data, level)
+    elif compression == JKRCompression.ASR:
+        raise NotImplementedError("ASR compression is not supported yet.")
     return data
 
 
@@ -147,7 +161,7 @@ def decompress_szp_unchecked(data) -> bytes:
     return bytes(decompressed)
 
 
-def compress_szp(data, level: int = 6) -> bytes:
+def compress_szp(data, level: int = 7) -> bytes:
     """
     Encodes the input data with SZP compression and returns the compressed bytes.
     Not implemented yet.
