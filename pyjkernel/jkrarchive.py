@@ -200,7 +200,7 @@ class JKRArchiveFile:
         return self._dir_._name_
 
     @property
-    def name(self):
+    def name(self) -> str:
         return self._dir_._name_
 
     @property
@@ -208,11 +208,11 @@ class JKRArchiveFile:
         return self._dir_._archive_
 
     @property
-    def index(self):
+    def index(self) -> int:
         return self._dir_._index_
 
     @property
-    def compression(self):
+    def compression(self) -> jkrcomp.JKRCompression:
         return jkrcomp.check_compression(self.data)
 
 
