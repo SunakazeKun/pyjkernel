@@ -522,7 +522,7 @@ class JKRArchive:
         self._create_dir_entry_(".", DirAttr.FOLDER, root_node, root_node)
         self._create_dir_entry_("..", DirAttr.FOLDER, None, root_node)
 
-        self._lookup_nodes_[root_name] = root_node
+        self._lookup_nodes_[root_name.lower()] = root_node
 
         self._fix_nodes_and_directories_()
 
